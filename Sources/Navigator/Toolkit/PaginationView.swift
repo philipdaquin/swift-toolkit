@@ -144,7 +144,14 @@ final class PaginationView: UIView, Loggable {
     private var measuredHeights: [Int: CGFloat] = [:]
     private var pageOrigins: [CGFloat] = []
     private var pageObservations: [Int: [NSKeyValueObservation]] = [:]
-    private var isApplyingContinuousLayout = false
+    /// Depth, not a flag: measuring a page can layout again while a layout is
+    /// already applying, and a bool would drop the guard too early.
+    private var continuousLayoutDepth = 0
+    private var appliedVerticalInset: (top: CGFloat, bottom: CGFloat) = (0, 0)
+
+    private var isApplyingContinuousLayout: Bool {
+        continuousLayoutDepth > 0
+    }
 
     init(
         frame: CGRect,
@@ -486,6 +493,13 @@ private extension PaginationView {
         measuredHeights.removeAll()
         pageOrigins.removeAll()
         pageObservations.removeAll()
+        appliedVerticalInset = (0, 0)
+        continuousLayoutDepth = 0
+    }
+
+    func verticalInsets() -> (top: CGFloat, bottom: CGFloat) {
+        let inset = continuousContentInset?() ?? .zero
+        return (inset.top, inset.bottom)
     }
 
     func pageHeight(at index: Int) -> CGFloat {
@@ -497,7 +511,11 @@ private extension PaginationView {
     }
 
     func rebuildPageOrigins() {
-        var y: CGFloat = 0
+        // The frame above the first line and below the last line is part of
+        // the content, so offset 0 shows it. A content inset would put that
+        // rest position at a negative offset, and every "go to start" would
+        // scroll the frame away.
+        var y: CGFloat = appliedVerticalInset.top
         pageOrigins = (0 ..< pageCount).map { index in
             defer { y += pageHeight(at: index) + continuousPageGap }
             return y
@@ -513,20 +531,38 @@ private extension PaginationView {
 
     var continuousContentHeight: CGFloat {
         guard pageCount > 0 else { return 0 }
-        return originOfPage(pageCount - 1) + pageHeight(at: pageCount - 1)
+        return originOfPage(pageCount - 1) + pageHeight(at: pageCount - 1) + appliedVerticalInset.bottom
+    }
+
+    func performContinuousLayout(_ body: () -> Void) {
+        continuousLayoutDepth += 1
+        body()
+        continuousLayoutDepth -= 1
     }
 
     /// Pins each loaded page to the screen and moves its content underneath.
     func layoutContinuousPages() {
         guard !isApplyingContinuousLayout, bounds.height > 0 else { return }
-        isApplyingContinuousLayout = true
-        defer { isApplyingContinuousLayout = false }
-
-        let inset = continuousContentInset?() ?? .zero
-        if scrollView.contentInset != inset {
-            scrollView.contentInset = inset
-        }
-        scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
+        performContinuousLayout {
+            let inset = verticalInsets()
+            if abs(inset.top - appliedVerticalInset.top) > 0.5
+                || abs(inset.bottom - appliedVerticalInset.bottom) > 0.5
+                || pageOrigins.count != pageCount
+            {
+                let delta = inset.top - appliedVerticalInset.top
+                appliedVerticalInset = inset
+                rebuildPageOrigins()
+                if abs(delta) > 0.5, scrollView.contentOffset.y > 0 {
+                    scrollView.contentOffset.y += delta
+                }
+            }
+            let horizontal = continuousContentInset?() ?? .zero
+            let sideInset = UIEdgeInsets(top: 0, left: horizontal.left, bottom: 0, right: horizontal.right)
+            if scrollView.contentInset != sideInset {
+                scrollView.contentInset = sideInset
+            }
+            scrollView.backgroundColor = .clear
+            scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
 
         let viewportHeight = scrollView.bounds.height
         let visibleTop = scrollView.contentOffset.y
@@ -540,9 +576,10 @@ private extension PaginationView {
             if let pageScroll = view.pageScrollView {
                 let offset = y - origin
                 if abs(pageScroll.contentOffset.y - offset) > 0.5 {
-                    pageScroll.contentOffset = CGPoint(x: 0, y: offset)
+                    pageScroll.contentOffset = CGPoint(x: 0, y: max(0, offset))
                 }
             }
+        }
         }
     }
 
@@ -562,16 +599,27 @@ private extension PaginationView {
     func scrollContinuous(toPage index: Int) {
         guard isContinuous else { return }
         setNeedsLayout()
-        isApplyingContinuousLayout = true
-        scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
-        scrollView.contentOffset = CGPoint(x: 0, y: originOfPage(index))
-        isApplyingContinuousLayout = false
+        let inset = verticalInsets()
+        appliedVerticalInset = inset
+        rebuildPageOrigins()
+        performContinuousLayout {
+            scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
+            // Page 0 includes the leading frame. Any later page starts at the
+            // top of the screen; its own go(to:) then moves within it.
+            let y: CGFloat = index == 0 ? 0 : originOfPage(index)
+            scrollView.contentOffset = CGPoint(x: 0, y: y)
+        }
         layoutContinuousPages()
     }
 
     func prepareForContinuousScroll(_ view: UIView & PageView, at index: Int) {
         guard isContinuous, let pageScroll = view.pageScrollView else { return }
         pageScroll.isScrollEnabled = false
+        // A disabled web-view pan still claims the drag and then drops it, so
+        // the publication scroll view never receives the finger.
+        pageScroll.panGestureRecognizer.isEnabled = false
+        pageScroll.bounces = false
+        pageScroll.showsVerticalScrollIndicator = false
 
         let size = pageScroll.observe(\.contentSize, options: [.new]) { [weak self, weak view] _, _ in
             MainActor.assumeIsolated {
@@ -600,11 +648,14 @@ private extension PaginationView {
         else {
             return
         }
-        let target = originOfPage(index) + pageScroll.contentOffset.y
+        let inner = pageScroll.contentOffset.y
+        // The start of the book includes the leading frame. A script that
+        // returns to progression 0 should show that frame, not slide it away.
+        let target = (index == 0 && inner <= 0.5) ? 0 : originOfPage(index) + max(inner, 0)
         guard abs(target - scrollView.contentOffset.y) > 0.5 else { return }
-        isApplyingContinuousLayout = true
-        scrollView.contentOffset = CGPoint(x: 0, y: target)
-        isApplyingContinuousLayout = false
+        performContinuousLayout {
+            scrollView.contentOffset = CGPoint(x: 0, y: target)
+        }
         layoutContinuousPages()
     }
 
@@ -635,13 +686,13 @@ private extension PaginationView {
         measuredHeights[index] = height
         rebuildPageOrigins()
 
-        isApplyingContinuousLayout = true
-        scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
-        if wasAbove {
-            // Keeps the text on screen still when a page above it resizes.
-            scrollView.contentOffset.y += height - oldHeight
+        performContinuousLayout {
+            scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
+            if wasAbove {
+                // Keeps the text on screen still when a page above it resizes.
+                scrollView.contentOffset.y += height - oldHeight
+            }
         }
-        isApplyingContinuousLayout = false
         layoutContinuousPages()
     }
 }
