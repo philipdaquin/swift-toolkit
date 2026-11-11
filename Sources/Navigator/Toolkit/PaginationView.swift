@@ -32,6 +32,18 @@ enum PageLocation: Equatable {
 protocol PageView {
     /// Moves the page to the given internal location.
     func go(to location: PageLocation) async
+
+    /// Scroll view showing the page content, driven by the pagination view in
+    /// continuous mode.
+    var pageScrollView: UIScrollView? { get }
+
+    /// Height of the page content, when it may be shorter than the viewport.
+    func measureContentHeight() async -> CGFloat?
+}
+
+extension PageView {
+    var pageScrollView: UIScrollView? { nil }
+    func measureContentHeight() async -> CGFloat? { nil }
 }
 
 protocol PaginationViewDelegate: AnyObject {
@@ -66,7 +78,7 @@ final class PaginationView: UIView, Loggable {
     private let preloadNextPositionCount: Int
 
     /// Queue of page index to be loaded next.
-    private var loadingIndexQueue: [(index: Int, location: PageLocation)] = []
+    private var loadingIndexQueue: [(index: Int, location: PageLocation?)] = []
 
     /// Returns whether the page views are loaded.
     var isEmpty: Bool {
@@ -97,6 +109,42 @@ final class PaginationView: UIView, Loggable {
     var isScrollEnabled: Bool {
         didSet { scrollView.isScrollEnabled = isScrollEnabled }
     }
+
+    // MARK: Continuous scroll state
+
+    /// When true, the pages form one vertical scroll: `scrollView` spans the
+    /// whole publication, and each page view stays pinned to the screen while
+    /// its own content offset moves underneath. Each web view therefore stays
+    /// viewport-sized and scrolls normally from the point of view of its
+    /// scripts. See https://oleb.net/blog/2014/05/scrollviews-inside-scrollviews/
+    var isContinuous = false {
+        didSet {
+            guard isContinuous != oldValue else { return }
+            scrollView.isPagingEnabled = !isContinuous
+            scrollView.bounces = isContinuous
+            scrollView.alwaysBounceVertical = isContinuous
+            scrollView.showsVerticalScrollIndicator = false
+            if !isContinuous {
+                scrollView.contentInset = .zero
+                scrollView.contentOffset = .zero
+            }
+            resetContinuousState()
+            setNeedsLayout()
+        }
+    }
+
+    /// Space around the whole publication in continuous mode.
+    var continuousContentInset: (() -> UIEdgeInsets)?
+
+    /// Space between two pages in continuous mode.
+    private let continuousPageGap: CGFloat = 48
+    /// Estimated height of a position until a page has been measured.
+    private let estimatedPositionHeight: CGFloat = 640
+
+    private var measuredHeights: [Int: CGFloat] = [:]
+    private var pageOrigins: [CGFloat] = []
+    private var pageObservations: [Int: [NSKeyValueObservation]] = [:]
+    private var isApplyingContinuousLayout = false
 
     init(
         frame: CGRect,
@@ -135,6 +183,11 @@ final class PaginationView: UIView, Loggable {
     }
 
     override public func layoutSubviews() {
+        if isContinuous {
+            layoutContinuousPages()
+            return
+        }
+
         guard !loadedViews.isEmpty else {
             scrollView.contentSize = bounds.size
             return
@@ -199,7 +252,9 @@ final class PaginationView: UIView, Loggable {
         loadedViews.removeAll()
         loadingIndexQueue.removeAll()
 
+        resetContinuousState()
         setCurrentIndex(index, location: location)
+        scrollContinuous(toPage: index)
     }
 
     /// Updates the current and pre-loaded views.
@@ -212,21 +267,24 @@ final class PaginationView: UIView, Loggable {
         // resource depending on the last index. This allows to navigate backward across resources,
         // starting from the end of each previous resource.
         let movingBackward = (currentIndex - 1 == index)
-        let location = location ?? (movingBackward ? .end : .start)
+        // In continuous mode a page without an explicit location is placed by
+        // the shared scroll position, not moved to its start or end.
+        let location = location ?? (isContinuous ? nil : (movingBackward ? .end : .start))
 
         currentIndex = index
 
         // To make sure that the views the most likely to be visible are loaded first, we first load
         // the current one, then the next ones and to finish the previous ones.
         scheduleLoadPage(at: index, location: location)
-        let lastIndex = scheduleLoadPages(from: index, upToPositionCount: preloadNextPositionCount, direction: .forward, location: .start)
-        let firstIndex = scheduleLoadPages(from: index, upToPositionCount: preloadPreviousPositionCount, direction: .backward, location: .end)
+        let lastIndex = scheduleLoadPages(from: index, upToPositionCount: preloadNextPositionCount, direction: .forward, location: isContinuous ? nil : .start)
+        let firstIndex = scheduleLoadPages(from: index, upToPositionCount: preloadPreviousPositionCount, direction: .backward, location: isContinuous ? nil : .end)
 
         for (i, view) in loadedViews {
             // Flushes the views that are not needed anymore.
             guard firstIndex ... lastIndex ~= i else {
                 view.removeFromSuperview()
                 loadedViews.removeValue(forKey: i)
+                pageObservations.removeValue(forKey: i)
                 continue
             }
         }
@@ -254,6 +312,7 @@ final class PaginationView: UIView, Loggable {
         {
             loadedViews[index] = view
             scrollView.addSubview(view)
+            prepareForContinuousScroll(view, at: index)
             setNeedsLayout()
         }
 
@@ -261,7 +320,9 @@ final class PaginationView: UIView, Loggable {
             return
         }
 
-        await view.go(to: location)
+        if let location {
+            await view.go(to: location)
+        }
         await loadNextPage()
     }
 
@@ -272,7 +333,7 @@ final class PaginationView: UIView, Loggable {
     ///   - sourceIndex: Starting page index from which to pre-load the views.
     ///   - direction: The direction in which to load the views from the sourceIndex.
     /// - Returns: The last page index to be loaded after reaching the requested number of positions.
-    private func scheduleLoadPages(from sourceIndex: Int, upToPositionCount positionCount: Int, direction: PageIndexDirection, location: PageLocation) -> Int {
+    private func scheduleLoadPages(from sourceIndex: Int, upToPositionCount positionCount: Int, direction: PageIndexDirection, location: PageLocation?) -> Int {
         let index = sourceIndex + direction.rawValue
         guard
             positionCount > 0,
@@ -294,7 +355,7 @@ final class PaginationView: UIView, Loggable {
     ///
     /// - Returns: Whether page is or will be loaded.
     @discardableResult
-    private func scheduleLoadPage(at index: Int, location: PageLocation) -> Bool {
+    private func scheduleLoadPage(at index: Int, location: PageLocation?) -> Bool {
         guard 0 ..< pageCount ~= index else {
             return false
         }
@@ -361,6 +422,11 @@ final class PaginationView: UIView, Loggable {
         scrollView.isScrollEnabled = isScrollEnabled
         setCurrentIndex(index, location: location)
 
+        if isContinuous {
+            scrollContinuous(toPage: index)
+            return
+        }
+
         scrollView.scrollRectToVisible(CGRect(
             origin: CGPoint(
                 x: xOffsetForIndex(index),
@@ -378,7 +444,14 @@ extension PaginationView: UIScrollViewDelegate {
     /// Note: using this approach might provide a better experience:
     /// https://oleb.net/blog/2014/05/scrollviews-inside-scrollviews/
 
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard isContinuous, !isApplyingContinuousLayout else { return }
+        layoutContinuousPages()
+        updateContinuousCurrentIndex()
+    }
+
     func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+        guard !isContinuous else { return }
         scrollView.isScrollEnabled = false
     }
 
@@ -387,12 +460,14 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        guard !isContinuous else { return }
         if !decelerate {
             scrollView.isScrollEnabled = isScrollEnabled
         }
     }
 
     public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard !isContinuous else { return }
         scrollView.isScrollEnabled = isScrollEnabled
 
         let currentOffset = (readingProgression == .rtl)
@@ -401,5 +476,172 @@ extension PaginationView: UIScrollViewDelegate {
 
         let newIndex = Int(round(currentOffset / scrollView.frame.width))
         setCurrentIndex(newIndex)
+    }
+}
+
+// MARK: - Continuous scroll
+
+private extension PaginationView {
+    func resetContinuousState() {
+        measuredHeights.removeAll()
+        pageOrigins.removeAll()
+        pageObservations.removeAll()
+    }
+
+    func pageHeight(at index: Int) -> CGFloat {
+        if let height = measuredHeights[index] {
+            return height
+        }
+        let positions = delegate?.paginationView(self, positionCountAtIndex: index) ?? 1
+        return CGFloat(max(positions, 1)) * estimatedPositionHeight
+    }
+
+    func rebuildPageOrigins() {
+        var y: CGFloat = 0
+        pageOrigins = (0 ..< pageCount).map { index in
+            defer { y += pageHeight(at: index) + continuousPageGap }
+            return y
+        }
+    }
+
+    func originOfPage(_ index: Int) -> CGFloat {
+        if pageOrigins.count != pageCount {
+            rebuildPageOrigins()
+        }
+        return pageOrigins.indices.contains(index) ? pageOrigins[index] : 0
+    }
+
+    var continuousContentHeight: CGFloat {
+        guard pageCount > 0 else { return 0 }
+        return originOfPage(pageCount - 1) + pageHeight(at: pageCount - 1)
+    }
+
+    /// Pins each loaded page to the screen and moves its content underneath.
+    func layoutContinuousPages() {
+        guard !isApplyingContinuousLayout, bounds.height > 0 else { return }
+        isApplyingContinuousLayout = true
+        defer { isApplyingContinuousLayout = false }
+
+        let inset = continuousContentInset?() ?? .zero
+        if scrollView.contentInset != inset {
+            scrollView.contentInset = inset
+        }
+        scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
+
+        let viewportHeight = scrollView.bounds.height
+        let visibleTop = scrollView.contentOffset.y
+        for (index, view) in loadedViews {
+            let origin = originOfPage(index)
+            let height = pageHeight(at: index)
+            let slotHeight = min(viewportHeight, height)
+            let y = min(max(visibleTop, origin), origin + height - slotHeight)
+            view.frame = CGRect(x: 0, y: y, width: bounds.width, height: slotHeight)
+
+            if let pageScroll = view.pageScrollView {
+                let offset = y - origin
+                if abs(pageScroll.contentOffset.y - offset) > 0.5 {
+                    pageScroll.contentOffset = CGPoint(x: 0, y: offset)
+                }
+            }
+        }
+    }
+
+    /// The current page is the one holding the middle of the screen.
+    func updateContinuousCurrentIndex() {
+        guard pageCount > 0 else { return }
+        let middle = scrollView.contentOffset.y + scrollView.bounds.height / 2
+        var index = 0
+        for candidate in 0 ..< pageCount where originOfPage(candidate) <= middle {
+            index = candidate
+        }
+        if index != currentIndex {
+            setCurrentIndex(index)
+        }
+    }
+
+    func scrollContinuous(toPage index: Int) {
+        guard isContinuous else { return }
+        setNeedsLayout()
+        isApplyingContinuousLayout = true
+        scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
+        scrollView.contentOffset = CGPoint(x: 0, y: originOfPage(index))
+        isApplyingContinuousLayout = false
+        layoutContinuousPages()
+    }
+
+    func prepareForContinuousScroll(_ view: UIView & PageView, at index: Int) {
+        guard isContinuous, let pageScroll = view.pageScrollView else { return }
+        pageScroll.isScrollEnabled = false
+
+        let size = pageScroll.observe(\.contentSize, options: [.new]) { [weak self, weak view] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, let view else { return }
+                self.updateMeasuredHeight(of: view, at: index)
+            }
+        }
+        // The page moved itself: a script scroll, such as restoring a location
+        // or following the spoken text. The shared position has to follow it.
+        let offset = pageScroll.observe(\.contentOffset, options: [.new]) { [weak self, weak pageScroll] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, let pageScroll else { return }
+                self.pageDidMoveItself(pageScroll, at: index)
+            }
+        }
+        pageObservations[index] = [size, offset]
+    }
+
+    func pageDidMoveItself(_ pageScroll: UIScrollView, at index: Int) {
+        guard
+            isContinuous,
+            !isApplyingContinuousLayout,
+            !scrollView.isTracking,
+            !scrollView.isDecelerating,
+            index == currentIndex
+        else {
+            return
+        }
+        let target = originOfPage(index) + pageScroll.contentOffset.y
+        guard abs(target - scrollView.contentOffset.y) > 0.5 else { return }
+        isApplyingContinuousLayout = true
+        scrollView.contentOffset = CGPoint(x: 0, y: target)
+        isApplyingContinuousLayout = false
+        layoutContinuousPages()
+    }
+
+    func updateMeasuredHeight(of view: UIView & PageView, at index: Int) {
+        guard let pageScroll = view.pageScrollView else { return }
+        let contentHeight = pageScroll.contentSize.height
+        guard contentHeight > 1 else { return }
+
+        if contentHeight > view.bounds.height + 1 {
+            applyMeasuredHeight(contentHeight, at: index)
+            return
+        }
+
+        // A web view never reports a content smaller than its own frame, so a
+        // page that fits on screen has to be measured from its document.
+        Task { @MainActor [weak self, weak view] in
+            guard let view, let height = await view.measureContentHeight(), height > 1 else { return }
+            self?.applyMeasuredHeight(height, at: index)
+        }
+    }
+
+    func applyMeasuredHeight(_ height: CGFloat, at index: Int) {
+        let oldHeight = pageHeight(at: index)
+        let wasMeasured = measuredHeights[index] != nil
+        guard !wasMeasured || abs(height - oldHeight) >= 1 else { return }
+
+        let wasAbove = originOfPage(index) + oldHeight <= scrollView.contentOffset.y
+        measuredHeights[index] = height
+        rebuildPageOrigins()
+
+        isApplyingContinuousLayout = true
+        scrollView.contentSize = CGSize(width: bounds.width, height: continuousContentHeight)
+        if wasAbove {
+            // Keeps the text on screen still when a page above it resizes.
+            scrollView.contentOffset.y += height - oldHeight
+        }
+        isApplyingContinuousLayout = false
+        layoutContinuousPages()
     }
 }

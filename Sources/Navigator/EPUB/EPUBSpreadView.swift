@@ -139,6 +139,25 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         webView.scrollView
     }
 
+    var pageScrollView: UIScrollView? {
+        scrollView
+    }
+
+    func measureContentHeight() async -> CGFloat? {
+        let script = """
+        (function() {
+            var body = document.body;
+            if (!body) return 0;
+            var style = getComputedStyle(body);
+            return Math.ceil(body.scrollHeight + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0));
+        })()
+        """
+        guard case let .success(value) = await evaluateScript(script), let height = value as? Double else {
+            return nil
+        }
+        return CGFloat(height)
+    }
+
     override func willMove(toSuperview newSuperview: UIView?) {
         super.willMove(toSuperview: newSuperview)
 

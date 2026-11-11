@@ -65,6 +65,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// Disables horizontal page turning when scroll is enabled.
         public var disablePageTurnsWhileScrolling: Bool
 
+        /// Shows a reflowable publication as one continuous vertical scroll
+        /// when scroll is enabled, instead of one scrollable resource per page.
+        public var continuousScroll: Bool
+
         /// Content insets used to add some vertical margins around reflowable
         /// EPUB publications. Note that the margins include the safe area
         /// insets. To avoid any "jump" when toggling the status bar, provide
@@ -103,6 +107,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             defaults: EPUBDefaults = EPUBDefaults(),
             editingActions: [EditingAction] = EditingAction.defaultActions,
             disablePageTurnsWhileScrolling: Bool = false,
+            continuousScroll: Bool = false,
             contentInset: [UIUserInterfaceSizeClass: EPUBContentInsets] = [
                 .compact: (top: 34, bottom: 34),
                 .regular: (top: 62, bottom: 62),
@@ -118,6 +123,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             self.defaults = defaults
             self.editingActions = editingActions
             self.disablePageTurnsWhileScrolling = disablePageTurnsWhileScrolling
+            self.continuousScroll = continuousScroll
             self.contentInset = contentInset
             self.preloadPreviousPositionCount = preloadPreviousPositionCount
             self.preloadNextPositionCount = preloadNextPositionCount
@@ -547,6 +553,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
         view.delegate = self
         view.backgroundColor = .clear
+        view.isContinuous = usesContinuousScroll
+        view.continuousContentInset = { [weak self] in
+            guard let self else { return .zero }
+            return self.delegate?.navigatorContentInset(self) ?? .zero
+        }
         return view
     }
 
@@ -555,6 +566,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
+        paginationView.isContinuous = usesContinuousScroll
         paginationView.isScrollEnabled = isPaginationViewScrollingEnabled
         reloadSpreads()
     }
@@ -644,7 +656,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     // MARK: - Navigator
 
     private var isPaginationViewScrollingEnabled: Bool {
-        !(config.disablePageTurnsWhileScrolling && settings.scroll)
+        usesContinuousScroll || !(config.disablePageTurnsWhileScrolling && settings.scroll)
+    }
+
+    private var usesContinuousScroll: Bool {
+        config.continuousScroll
+            && settings.scroll
+            && !settings.verticalText
+            && (publication.metadata.layout ?? .reflowable) == .reflowable
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -1034,6 +1053,11 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
 
 extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets {
+        // The pagination view holds the inset around the whole publication.
+        if usesContinuousScroll {
+            return .zero
+        }
+
         if let inset = delegate?.navigatorContentInset(self) {
             return inset
         }
