@@ -39,11 +39,16 @@ protocol PageView {
 
     /// Height of the page content, when it may be shorter than the viewport.
     func measureContentHeight() async -> CGFloat?
+
+    /// Calls `onChange` when the page content resizes after load, such as when
+    /// an image arrives.
+    func observeContentHeight(_ onChange: @escaping () -> Void)
 }
 
 extension PageView {
     var pageScrollView: UIScrollView? { nil }
     func measureContentHeight() async -> CGFloat? { nil }
+    func observeContentHeight(_ onChange: @escaping () -> Void) {}
 }
 
 protocol PaginationViewDelegate: AnyObject {
@@ -216,7 +221,7 @@ final class PaginationView: UIView, Loggable {
         if newSuperview == nil {
             // Remove all spread views to break retain cycles
             for (_, view) in loadedViews {
-                view.removeFromSuperview()
+                detach(view)
             }
             loadedViews.removeAll()
         }
@@ -254,7 +259,7 @@ final class PaginationView: UIView, Loggable {
         self.readingProgression = readingProgression
 
         for (_, view) in loadedViews {
-            view.removeFromSuperview()
+            detach(view)
         }
         loadedViews.removeAll()
         loadingIndexQueue.removeAll()
@@ -289,7 +294,7 @@ final class PaginationView: UIView, Loggable {
         for (i, view) in loadedViews {
             // Flushes the views that are not needed anymore.
             guard firstIndex ... lastIndex ~= i else {
-                view.removeFromSuperview()
+                detach(view)
                 loadedViews.removeValue(forKey: i)
                 pageObservations.removeValue(forKey: i)
                 continue
@@ -318,7 +323,16 @@ final class PaginationView: UIView, Loggable {
             let view = delegate?.paginationView(self, pageViewAtIndex: index)
         {
             loadedViews[index] = view
-            scrollView.addSubview(view)
+            if isContinuous {
+                // A clip as tall as the page holds a web view as tall as the
+                // screen. The web view's size never follows its measured
+                // height, so measuring cannot change what it measures.
+                let clip = ContinuousPageClipView()
+                clip.addSubview(view)
+                scrollView.addSubview(clip)
+            } else {
+                scrollView.addSubview(view)
+            }
             prepareForContinuousScroll(view, at: index)
             setNeedsLayout()
         }
@@ -571,7 +585,14 @@ private extension PaginationView {
             let height = pageHeight(at: index)
             let slotHeight = min(viewportHeight, height)
             let y = min(max(visibleTop, origin), origin + height - slotHeight)
-            view.frame = CGRect(x: 0, y: y, width: bounds.width, height: slotHeight)
+            let clipFrame = CGRect(x: 0, y: y, width: bounds.width, height: slotHeight)
+            let pageFrame = CGRect(x: 0, y: 0, width: bounds.width, height: viewportHeight)
+            if let clip = view.superview as? ContinuousPageClipView {
+                if clip.frame != clipFrame { clip.frame = clipFrame }
+                if view.frame != pageFrame { view.frame = pageFrame }
+            } else {
+                view.frame = clipFrame
+            }
 
             if let pageScroll = view.pageScrollView {
                 let offset = y - origin
@@ -636,6 +657,10 @@ private extension PaginationView {
             }
         }
         pageObservations[index] = [size, offset]
+        view.observeContentHeight { [weak self, weak view] in
+            guard let self, let view, self.loadedViews[index] === view else { return }
+            self.updateMeasuredHeight(of: view, at: index)
+        }
     }
 
     func pageDidMoveItself(_ pageScroll: UIScrollView, at index: Int) {
@@ -694,5 +719,28 @@ private extension PaginationView {
             }
         }
         layoutContinuousPages()
+    }
+}
+
+/// Holds one page in continuous scroll and clips it to the page's height.
+private final class ContinuousPageClipView: UIView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        clipsToBounds = true
+        backgroundColor = .clear
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+private extension PaginationView {
+    /// Removes a page view, and its continuous-scroll clip with it.
+    func detach(_ view: UIView) {
+        let clip = view.superview as? ContinuousPageClipView
+        view.removeFromSuperview()
+        clip?.removeFromSuperview()
     }
 }

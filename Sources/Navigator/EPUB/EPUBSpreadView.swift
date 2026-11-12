@@ -143,13 +143,29 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         scrollView
     }
 
+    private var contentHeightChanged: (() -> Void)?
+
+    func observeContentHeight(_ onChange: @escaping () -> Void) {
+        contentHeightChanged = onChange
+    }
+
     func measureContentHeight() async -> CGFloat? {
         let script = """
         (function() {
             var body = document.body;
             if (!body) return 0;
+            if (!window.__cocoBodyResizeObserver && window.ResizeObserver) {
+                window.__cocoBodyResizeObserver = new ResizeObserver(function() {
+                    try { webkit.messageHandlers.cocoContentResized.postMessage(body.scrollHeight); } catch (e) {}
+                });
+                window.__cocoBodyResizeObserver.observe(body);
+            }
             var style = getComputedStyle(body);
-            return Math.ceil(body.scrollHeight + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0));
+            var margins = (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
+            // A first child's top margin collapses through the body, so
+            // scrollHeight misses it. The body's bottom edge does not.
+            var bottom = body.getBoundingClientRect().bottom + window.scrollY + (parseFloat(style.marginBottom) || 0);
+            return Math.ceil(Math.max(body.scrollHeight + margins, bottom));
         })()
         """
         guard case let .success(value) = await evaluateScript(script), let height = value as? Double else {
@@ -450,6 +466,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         registerJSMessage(named: "selectionChanged") { [weak self] in self?.selectionDidChange($0) }
         registerJSMessage(named: "decorationActivated") { [weak self] in self?.decorationDidActivate($0) }
         registerJSMessage(named: "keyEventReceived") { [weak self] in self?.didReceiveKeyEvent($0) }
+        registerJSMessage(named: "cocoContentResized") { [weak self] _ in self?.contentHeightChanged?() }
     }
 
     /// Add the message handlers for incoming javascript events.
